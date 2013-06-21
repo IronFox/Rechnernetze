@@ -23,9 +23,9 @@ public class TCPTransferTest {
         int port = 10002;
         try
         {
-            if (args.length > 0)
+            if (args.length > 0)    // if argument exists
             {
-                for (int i = 1; i < 300; i++)
+                for (int i = 1; i < 300; i++)   //
                 {
                     Client c = new Client(i,bytes,args[0],port);
                     c.start();
