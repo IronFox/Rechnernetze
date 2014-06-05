@@ -2,6 +2,7 @@
 #include <thread>
 #include <mutex>
 #include <sstream>
+#include <vector>
 
 #define DEFAULT_PORT	12345
 
@@ -113,7 +114,6 @@ size_t inputBufferUsage = 0;						//!< number of meaningful characters in the bu
 size_t maxInputBufferUsage = sizeof(inputBuffer)-1;	//!< maximum number of possible meaningful characters. since 0 must be written, -1 is applied
 
 
-volatile SOCKET sock = INVALID_SOCKET;
 
 
 /**
@@ -139,14 +139,7 @@ void PrintLine(const std::string&line)
 */
 void Die(const std::string msg)
 {
-	SOCKET old = sock;
-	sock = INVALID_SOCKET;
-	if (old)
-		closesocket(old);
 	std::cerr <<std::endl << msg<<std::endl;
-	netThread.join();
-	//netThread.detach();
-	netThread.swap(std::thread());
 	#ifdef _WIN32
 		WSACleanup(); //Clean up Winsock
 	#endif
@@ -155,25 +148,70 @@ void Die(const std::string msg)
 }
 
 
+
+
+std::vector<SOCKET>	clients;
+std::mutex			clientLock;
+
+
+
+void Insert(SOCKET sock)
+{
+	clientLock.lock();
+	clients.push_back(sock);
+	clientLock.unlock();
+}
+
+
+bool verbose = true;
+
 /**
-	@brief Handle user-input
+	@brief Handle client message
 */
-void Submit(const std::string&input)
+void Broadcast(const std::string&input)
 {
 	char buffer[0x100];
 	unsigned char len = (unsigned char)std::min<size_t>(input.length(),255);
 	((unsigned char&)buffer[0]) = len;
 	memcpy(buffer+1,input.c_str(),len);
-	int rs = send(sock,buffer,len+1,0);
-	if (rs < 0)
-		Die("Failed to send message");
 
+	clientLock.lock();
+	std::cout << input << std::endl;
+	std::vector<size_t> toErase;
+	if (verbose)
+		std::cout << "iterating "<<clients.size()<< " clients "<<std::endl;
+	for (std::vector<SOCKET>::iterator it = clients.begin(); it != clients.end(); ++it)
+	{
+		if (verbose)
+			std::cout << "sending "<<(int)(len+1)<< " bytes to socket"<<std::endl;
+		int rs = send(*it,buffer,len+1,0);
+		if (rs <= 0)
+		{
+			closesocket(*it);
+			toErase.push_back(it - clients.begin());
+		}
+	}
+
+	size_t erased = 0;
+	for (auto it = toErase.begin(); it != toErase.end(); ++it)
+	{
+		clients.erase(clients.begin() + *it -erased);
+		erased++;
+	}
+
+	clientLock.unlock();
 }
 
+struct ClientInfo
+{
+	SOCKET		sock;
+	std::string	initialName;
+	std::thread*thread;
+};
 
-bool verbose = false;
 
-void GetServerMessage(volatile SOCKET&sock, std::string&outMessage)
+
+void GetClientMessage(SOCKET&sock, std::string&outMessage)
 {
 	char		buffer[0x100], //255 + trailing 0
 				*bufferAt = buffer,
@@ -215,19 +253,42 @@ void GetServerMessage(volatile SOCKET&sock, std::string&outMessage)
 
 }
 
-
 /**
-	@brief Thread main function that handles messages from the server
+	@brief Thread main function that handles messages from a specific client
 */
-void NetLoop()
+void ThreadLoop(ClientInfo info)
 {
-	
-	std::string msg;
+	int cnt = 0;
+
+
+
+	std::string clientName = info.initialName;;
+	SOCKET sock = info.sock;
+
+	Broadcast(clientName+" connected");
+
+	std::string message;
+
 	while (sock != INVALID_SOCKET)
 	{
-		GetServerMessage(sock,msg);
-		PrintLine(msg);
+		GetClientMessage(sock,message);
+		if (message.empty())
+		{
+			std::cout << "message is empty"<<std::endl;
+			continue;
+		}
+		if (message.at(0) ==':')
+		{
+			std::string oldName = clientName;
+			clientName = message.substr(1);
+			Broadcast(oldName+" renamed to "+clientName);
+		}
+		else
+			Broadcast(clientName+": "+message);
 	}
+	Broadcast(clientName+" disconnected");
+	info.thread->detach();
+	delete info.thread;
 }
 
 
@@ -252,125 +313,47 @@ int main(int argc, const char* argv[])
 		}
 	#endif
 
-
-	std::cout << "Enter Server URL: ";
-	char url[0x100];
-	std::cin.getline(url,sizeof(url));
-
-	std::cout << "Enter your Nickname: ";
-	char nickname[0x100] = ":";
-	std::cin.getline(nickname+1,sizeof(nickname)-1);
-
-	char*colon = strchr(url,':');
-	std::string surl,sport;
+	SOCKET sock = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+	if (sock == INVALID_SOCKET)
+		Die("unable to create socket");
 	
-	if (colon != NULL)
-	{
-		*colon = 0;
-		sport = colon+1;
-	}
-	else
-	{
-		sport = ToString(DEFAULT_PORT);
-	}
-	surl = url;
-	
-	PrintLine("Attempting to connect to "+surl);
+	SOCKADDR_IN addr;
+	int addrlen = sizeof(addr);
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(DEFAULT_PORT);
+	addr.sin_addr.s_addr = INADDR_ANY;
 
-	ADDRINFOA hints;
-	memset(&hints,0,sizeof(hints));
-	hints.ai_protocol = IPPROTO_TCP;
-    hints.ai_family = AF_UNSPEC;
-	//hints.
-	ADDRINFOA*result;
-	if (getaddrinfo(surl.c_str(),sport.c_str(),&hints,&result) != 0)
+	if (::bind(sock,(SOCKADDR*)&addr, sizeof(addr)) != 0)
 	{
-		Die("Call to getaddrinfo() failed");
+		closesocket(sock);
+		Die("unable to bind socket");
 	}
 
-	bool connected = false;
-	while (result)		//search through all available results until one allows connection. 
-						//Chances are we get IPv4 and IPv6 results here but the server will only answer to one of those
+	if (::listen(sock,5) != 0)
 	{
-		sock = socket(result->ai_family,result->ai_socktype,result->ai_protocol);
-		if (sock != INVALID_SOCKET)	//if we can create a socket then we can attempt a connection. It would be rather unusual for this not to work but...
-		{
-			if (!connect(sock,result->ai_addr,result->ai_addrlen))	//attempt connnection
-			{
-				//connected
-				PrintLine("Connected to "+ToString(*result));	//yay, it worked
-				connected = true;
-				break;
-			}
-			else
-			{
-				closesocket(sock);		//these aren't the droids we're looking for.
-				sock = INVALID_SOCKET;
-			}
-
-		}
-		
-		result = result->ai_next;	//moving on.
+		closesocket(sock);
+		Die("unable to listen");
 	}
-	if (!connected)
-		Die("Failed to connect to "+surl+":"+sport);	//so, yeah, none of them worked.
 
-	Submit(nickname);	//includes leading ':', so that the server knows this is a name, not a message
-
-	netThread = std::thread(NetLoop);	//start read-thread
+	std::cout << "Server online"<<std::endl;
 	
 	while (sock != INVALID_SOCKET)
 	{
-		char c = _getch();	//keep reading characters
+		struct sockaddr_in addr;
+		int len = sizeof(addr);
+		SOCKET client = accept(sock,(sockaddr*)&addr,&len);
+		if (client != INVALID_SOCKET)
 		{
-			if (c == 3)	//this only works on windows, but ctrl-c is handled better on linux anyway
-			{
-				Die("Ctrl+C");
-				break;
-			}
-			consoleLock.lock();
-			if (c == '\n' || c == '\r')							//user pressed enter/return:
-			{
-				std::string submit = inputBuffer;				//copy buffer to string
-				std::cout << '\r';								//move cursor to line beginning
-				for (size_t i = 0; i < inputBufferUsage+1; i++)	//overwrite line with as many blanks as there were characters
-					std::cout << ' ';
-				std::cout << '\r';								//move cursor to line beginning again
-				inputBufferUsage = 0;							//reset character pointer
-				inputBuffer[0] = 0;								//write terminating zero to first char
-				consoleLock.unlock();							//release console lock
-			
-				Submit(submit);									//process input
-			}
-			else
-			{
-				if (c == Backspace)										//user pressed backspace
-				{
-					if (inputBufferUsage > 0)
-					{
-						inputBuffer[--inputBufferUsage] = 0;	//decrement character pointer and overwrite with 0
-						std::cout << '\r'<<':'<<inputBuffer<<" \r"<<':'<<inputBuffer;
-					}
-				}
-				else
-				{
-					if (c == '!' || c == '?' || ( c != -32 && (isalnum(c) || c == ' ')))	//ordinary character
-					{
-						if (inputBufferUsage+1 < maxInputBufferUsage)	//only allow up to 255 characters though
-						{
-							inputBuffer[inputBufferUsage++] = c;	//write to the end of the buffer
-							inputBuffer[inputBufferUsage] = 0;		//and terminate properly
-						}
-						std::cout << c;		//update console
-					}
-				}
-				consoleLock.unlock();
-			}
+			char buffer[0x1000];
+			inet_ntop(AF_INET,&addr,buffer,sizeof(buffer));
+			Insert(client);
+			ClientInfo info;
+			info.sock = client;
+			info.initialName = buffer;
+			info.thread = new std::thread();
+			info.thread->swap(std::thread(ThreadLoop,info));
 		}
 	}
-	netThread.join();
-	netThread.detach();
-	netThread.swap(std::thread());
 	#ifdef _WIN32
 		WSACleanup();
 	#endif
